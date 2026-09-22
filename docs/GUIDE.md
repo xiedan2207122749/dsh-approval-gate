@@ -98,7 +98,7 @@ dsh plugin --profile web add "github:moon09300731/dsh-approval-gate#main"
 ```
 
 - `denyKeywords`：命中即转人工（不可逆危险操作）
-- `allowRules`：每条规则 `tool` / `mode` / `category` / `contains` 均满足才放行（缺省表示任意）。学习沉淀的规则也会写入这里
+- `allowRules`：每条规则 `tool` / `mode` / `category` / `contains` 均满足才放行（缺省表示任意）。学习沉淀的规则也会写入这里。**`contains` 的匹配文本 = 操作理由 + 本次调用的真实文件路径**（v0.5.4+，路径由工具参数回溯得到）——否则路径型规则只有在模型恰好把路径写进理由时才生效
 - `denyRules`：用户裁决拒绝后自动写入，命中即转人工（不学习）
 - `hardCategories`：flash 判 RISKY 且命中这些类别 → 直接转人工（不计数、不学习）
 - `riskyThreshold`：中立类别的人工确认阈值（默认 3）——同一「工具+模式+类别」被人工确认 N-1 次后，第 N 次起自动放行并沉淀规则
@@ -171,7 +171,8 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 - 挂载于 `approval/request` 瀑布最前（`prepend: true`，先于 web answerer 接单）
 - 门控：`permissionPresets.current(session.events) === 'auto-approve'`
 - DSH 审批触发点是沙箱越界，`reason` 固定为 `escalate sandbox to <mode>: <justification>`，`mode` 仅 `workspace-write` / `danger-full-access` 两级
-- flash 判定：优先 `reasoningEffort: 'off'`（不思考、结论最干净）+ `maxTokens: 256`，输出 `SAFE` 或 `RISKY:<category>`；**路由不支持 `off` 档时自动降级为「不带 effort」调用一次并记住该路由**（v0.5.3+），不会因此整体不可用
+- flash 判定：优先 `reasoningEffort: 'off'`（不思考、结论最干净）+ `maxTokens: 256`，输出 `SAFE` 或 `RISKY:<category>`；**路由不支持 `off` 档时自动降级为「不带 effort」调用一次并记住该路由**（v0.5.3+），此时 `maxTokens` 提到 1024 给推理文本留空间（v0.5.4+）
+- 判定文本解析：**推理文本不参与结论判定**（否则推理里的 safe/risky 字样会被误当成结论而误放行），只解析正式回答；出现多条结论时**取最后一次**（v0.5.4+）
 - 超时兜底：`AbortController` 传入 `llm.stream` 的 signal（可取消底层请求），`Promise.race` + `ctx.timeout(judgeTimeoutMs)`，超时 abort 并重试 1 次
 - 同类验证：把当前操作背景/目的 + 用户确认样本交给 flash 语义判断（`SAME`/`DIFFERENT`），失败按 DIFFERENT 处理
 - 学习闭环：通过 waterfall 的 `next()` 返回值捕获人工裁决结果（`allowed-once` 沉淀 / `rejected` 升级）

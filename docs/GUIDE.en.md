@@ -98,7 +98,7 @@ Data files live under `$DSH_HOME/auto-approve/` (default `~/.dsh/auto-approve/`)
 ```
 
 - `denyKeywords`: a hit sends the request to human (irreversible operations)
-- `allowRules`: each rule matches on `tool` / `mode` / `category` / `contains` (omitted fields match anything). Learned rules are also written here
+- `allowRules`: each rule matches on `tool` / `mode` / `category` / `contains` (omitted fields match anything). Learned rules are also written here. **`contains` matches the operation reason AND the real file paths of this call** (v0.5.4+, resolved from the tool arguments) — otherwise a path rule such as `contains:"d:\workspace\"` only works when the model happens to spell the path out in its reason
 - `denyRules`: written automatically after a human rejection; a hit goes to human (no learning)
 - `hardCategories`: flash `RISKY` in these categories → directly human (no counting, no learning)
 - `riskyThreshold`: neutral confirmation threshold (default 3) — after N-1 human confirmations of the same tool+mode+category, the Nth occurrence auto-approves and persists a rule
@@ -171,7 +171,8 @@ Neutral confirmation learning: each human approval of the same tool|mode|categor
 - Mounted at the front of the `approval/request` waterfall (`prepend: true`, before the web answerer)
 - Gate: `permissionPresets.current(session.events) === 'auto-approve'`
 - DSH approval fires on sandbox escalation; `reason` is always `escalate sandbox to <mode>: <justification>`, with `mode` in `workspace-write` / `danger-full-access`
-- flash judgment: `reasoningEffort: 'off'` first (no thinking, cleanest verdict) + `maxTokens: 256`, outputs `SAFE` or `RISKY:<category>`; when the route rejects the `off` effort the judge **falls back to a call without any effort once and remembers that route** (v0.5.3+), so it can never be disabled by an effort mismatch
+- flash judgment: `reasoningEffort: 'off'` first (no thinking, cleanest verdict) + `maxTokens: 256`, outputs `SAFE` or `RISKY:<category>`; when the route rejects the `off` effort the judge **falls back to a call without any effort once and remembers that route** (v0.5.3+), with `maxTokens` raised to 1024 to leave room for reasoning text (v0.5.4+)
+- Verdict parsing: **reasoning text never counts as the verdict** (a "looks safe" phrase in the reasoning must not auto-approve the call); only the answer is parsed, and when several verdicts appear the **last one wins** (v0.5.4+)
 - Timeout: `AbortController` signal into `llm.stream` (cancellable), `Promise.race` + `ctx.timeout(judgeTimeoutMs)`, abort + one retry
 - Similarity verification: current operation context + confirmed samples to flash (`SAME`/`DIFFERENT`); failure counts as DIFFERENT
 - Learning loop: captures human verdicts through the waterfall `next()` return (`allowed-once` persists / `rejected` upgrades)
