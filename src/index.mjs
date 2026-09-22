@@ -779,15 +779,19 @@ function parseReason(reason) {
   return { mode: '', justification: String(reason || '') }
 }
 
-// 规则匹配：tool / mode / category / contains 均满足（缺省表示任意）
-function matchRule(rules, toolName, mode, category, justification) {
+// 规则匹配：tool / mode / category / contains 均满足（缺省表示任意）。
+// contains 的匹配文本 = 操作理由 + 「本次调用的真实文件路径」（callId 回溯工具参数得到）。
+// 只匹配理由文本是不够的：像 contains:"d:\workspace\" 这样的路径规则，会因模型没把路径
+// 写进理由而整条失效，退化成 flash 判定（判定器一有波动就全部转人工）。
+function matchRule(rules, toolName, mode, category, justification, files) {
   const list = rules || []
-  const j = String(justification || '').toLowerCase()
+  const paths = Array.isArray(files) ? files.join('\n') : String(files || '')
+  const haystack = `${justification || ''}\n${paths}`.toLowerCase()
   for (const rule of list) {
     if (rule.tool && rule.tool !== toolName) continue
     if (rule.mode && rule.mode !== mode) continue
     if (rule.category && rule.category !== category) continue
-    if (rule.contains && !j.includes(String(rule.contains).toLowerCase())) continue
+    if (rule.contains && !haystack.includes(String(rule.contains).toLowerCase())) continue
     return rule
   }
   return null
@@ -1179,11 +1183,16 @@ export default {
     /**
      * 底层 flash 调用：流式请求并累积文本输出（可取消）。
      * 由 judgeOnce / verifySimilarity 共用；异常向上抛，由 withRetry 决定重试或降级。
+     *
+     * 正式回答与推理文本分开累积：思考档（路由默认档）下模型先输出大段推理再给结论，
+     * 推理里的 safe/risky 字样不是结论——混进判定文本会把「看起来安全」误判成 SAFE 自动放行。
+     * token 上限按档位给：不思考档 256 足够（结论仅几个词）；思考档给 1024，否则推理没写完就被截断。
      * @param {string|undefined} effort - reasoning effort；undefined 表示用路由默认档
-     * @returns {Promise<string>} 模型原始输出文本
+     * @returns {Promise<string>} 判定文本（优先正式回答，无回答时退回推理文本）
      */
     const callFlashOnce = async (provider, model, userText, systemPrompt, signal, effort) => {
-      let text = ''
+      let answer = ''
+      let reasoning = ''
       for await (const chunk of llm.stream({
         provider,
         model,
@@ -1191,12 +1200,11 @@ export default {
         system: systemPrompt,
         temperature: 0,
         ...effort === undefined ? {} : { reasoningEffort: effort },
-        // 256：结论仅几个词，但模型偶发先输出复述/思考文本，64 会被截断导致解析失败
-        maxTokens: 256,
+        maxTokens: effort === 'off' ? 256 : 1024,
         signal
       })) {
-        if (chunk.type === 'text-delta') text += chunk.text
-        else if (chunk.type === 'reasoning-delta') text += chunk.text
+        if (chunk.type === 'text-delta') answer += chunk.text
+        else if (chunk.type === 'reasoning-delta') reasoning += chunk.text
         else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
           const failure = chunk.reason.failure
           const message = failure && failure.message ? failure.message : chunk.reason.kind
@@ -1205,7 +1213,7 @@ export default {
           throw error
         }
       }
-      return text
+      return answer.trim() ? answer : reasoning
     }
 
     /**
@@ -1240,15 +1248,16 @@ export default {
         '请判断：执行该操作是否会造成无法回补的后果或触碰敏感资源？输出 SAFE 或 RISKY:<类别>。'
       ].join('\n')
       const text = await callFlash(user, SYSTEM_PROMPT, signal)
-      const trimmed = text.trim().toUpperCase()
-      const riskyMatch = trimmed.match(/RISKY\s*[:：]\s*([A-Z_]+)/)
-      if (riskyMatch) {
-        const category = riskyMatch[1].toLowerCase()
-        return { verdict: 'risky', category }
+      // 取「最后一次」出现的结论：模型可能先复述提示再给答案，末尾的才是判定结果。
+      // 用最后一次而非 includes()，既避免被复述文本里的字样带偏，也避免多结论时取错。
+      let last = null
+      for (const m of text.matchAll(/RISKY\s*[:：]?\s*([A-Z_]*)|SAFE/gi)) last = m
+      if (last) {
+        if (/^SAFE$/i.test(last[0].trim())) return { verdict: 'safe' }
+        const category = String(last[1] || '').toLowerCase()
+        // 裸 RISKY（无类别，旧协议残留）→ 按中立处理（有计数/裁决兜底）
+        return { verdict: 'risky', category: category || 'neutral' }
       }
-      // 裸 RISKY（无类别，旧协议残留）→ 按中立处理（有计数/裁决兜底）
-      if (trimmed.includes('RISKY')) return { verdict: 'risky', category: 'neutral' }
-      if (trimmed.includes('SAFE')) return { verdict: 'safe' }
       // 模型表达不确定/无法判断（而非复述 prompt）→ 按中立处理（走确认制，fail-safe）
       if (/无法判断|无法确定|不确定|不能确定|无法评估|UNCERTAIN|CANNOT (JUDGE|DETERMINE|ASSESS)/i.test(text)) {
         return { verdict: 'risky', category: 'neutral' }
@@ -1419,7 +1428,7 @@ export default {
         }
 
         // 2. 白名单层：命中规则 → 直接放行（确定性，不过 flash）
-        const matchedRule = matchRule(config.allowRules, toolName, mode, null, justification)
+        const matchedRule = matchRule(config.allowRules, toolName, mode, null, justification, toolFiles)
         if (matchedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'rule', filesOpt)
@@ -1458,14 +1467,14 @@ export default {
         }
 
         // 4d. denyRules 命中（此前用户裁决拒绝过的 key）→ 直接转人工（拒绝优先于沉淀）
-        if (matchRule(config.denyRules, toolName, mode, cat, justification)) {
+        if (matchRule(config.denyRules, toolName, mode, cat, justification, toolFiles)) {
           audit(`DENYRULE ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'deny-rule')
         }
 
         // 4e. 沉淀规则（带 category 的学习规则，用户批准过）→ 直接放行，不再计数
         const key = learnKey(toolName, mode, cat)
-        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, justification)
+        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, justification, toolFiles)
         if (learnedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${learnedRule.description || '沉淀规则'})`)
           delete learning.stats[key]
